@@ -44,6 +44,20 @@ func (w *worker) start(conn *RedisConn, job *Job) error {
 	return w.process.start(conn)
 }
 
+func (w *worker) updateJobStatus(conn *RedisConn, job *Job, status string) {
+	jobStatus := job.Status
+	logger.Debugf("Job (%s) status: %v", job.Payload.UUID, job.Status)
+	if (jobStatus == nil) {
+		jobStatus = &JobStatus{UpdatedAt: time.Now().UTC()}
+	}
+	jobStatus.Status = status
+	buffer, err := json.Marshal(jobStatus)
+	if err != nil {
+		return
+	}
+	conn.Send("SET", fmt.Sprintf("%sjob:%s:status", workerSettings.Namespace, job.Payload.UUID), buffer)
+}
+
 func (w *worker) fail(conn *RedisConn, job *Job, err error) error {
 	failure := &failure{
 		FailedAt:  time.Now(),
@@ -59,13 +73,14 @@ func (w *worker) fail(conn *RedisConn, job *Job, err error) error {
 	}
 	conn.Send("RPUSH", fmt.Sprintf("%sfailed", workerSettings.Namespace), buffer)
 
+	w.updateJobStatus(conn, job, STATUS_FAILED)
 	return w.process.fail(conn)
 }
 
 func (w *worker) succeed(conn *RedisConn, job *Job) error {
 	conn.Send("INCR", fmt.Sprintf("%sstat:processed", workerSettings.Namespace))
 	conn.Send("INCR", fmt.Sprintf("%sstat:processed:%s", workerSettings.Namespace, w))
-
+	w.updateJobStatus(conn, job, STATUS_COMPLETED)
 	return nil
 }
 
@@ -105,9 +120,11 @@ func (w *worker) work(jobs <-chan *Job, monitor *sync.WaitGroup) {
 		}()
 		for job := range jobs {
 			if workerFunc, ok := workers[job.Payload.Class]; ok {
+				logger.Debugf("start: (Job{%s} | %s | %s | %v)", job.Queue, job.Payload.Class, job.Payload.UUID, job.Payload.Args)
+				w.updateJobStatus(conn, job, STATUS_RUNNING)
 				w.run(job, workerFunc)
 
-				logger.Debugf("done: (Job{%s} | %s | %v)", job.Queue, job.Payload.Class, job.Payload.Args)
+				logger.Debugf("done: (Job{%s} | %s | %s | %v)", job.Queue, job.Payload.Class, job.Payload.UUID, job.Payload.Args)
 			} else {
 				errorLog := fmt.Sprintf("No worker for %s in queue %s with args %v", job.Payload.Class, job.Queue, job.Payload.Args)
 				logger.Critical(errorLog)

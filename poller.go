@@ -23,6 +23,25 @@ func newPoller(queues []string, isStrict bool) (*poller, error) {
 	}, nil
 }
 
+func (p *poller) getJobStatus(conn *RedisConn, job *Job) *JobStatus {
+	reply, err := conn.Do("GET", fmt.Sprintf("%sjob:%s:status", workerSettings.Namespace, job.Payload.UUID))
+	if err != nil || reply == nil {
+		logger.Debugf("Got error while fetching job (%s) status: %v", job.Payload.UUID, err);
+		return nil
+	}
+
+	jobStatus := &JobStatus{}
+	decoder := json.NewDecoder(bytes.NewReader(reply.([]byte)))
+	// we dont care about status here
+	if err = decoder.Decode(jobStatus); err != nil {
+		logger.Debugf("Got error while decoding job (%s) status: %v", job.Payload.UUID, err);
+		return nil
+	}
+	logger.Debugf("Got job (%s) status: %v", job.Payload.UUID, jobStatus);
+
+	return jobStatus
+}
+
 func (p *poller) getJob(conn *RedisConn) (*Job, error) {
 	for _, queue := range p.queues(p.isStrict) {
 		logger.Debugf("Checking %s", queue)
@@ -31,21 +50,32 @@ func (p *poller) getJob(conn *RedisConn) (*Job, error) {
 		if err != nil {
 			return nil, err
 		}
-		if reply != nil {
-			logger.Debugf("Found job on %s", queue)
-
-			job := &Job{Queue: queue}
-
-			decoder := json.NewDecoder(bytes.NewReader(reply.([]byte)))
-			if workerSettings.UseNumber {
-				decoder.UseNumber()
-			}
-
-			if err := decoder.Decode(&job.Payload); err != nil {
-				return nil, err
-			}
-			return job, nil
+		if reply == nil {
+			return nil, nil
 		}
+
+		logger.Debugf("Found job on %s", queue)
+
+		job := &Job{Queue: queue}
+
+		decoder := json.NewDecoder(bytes.NewReader(reply.([]byte)))
+		if workerSettings.UseNumber {
+			decoder.UseNumber()
+		}
+
+		if err := decoder.Decode(&job.Payload); err != nil {
+			return nil, err
+		}
+
+		//try to get job status
+		count := 0
+		for job.Status == nil && count < 5 {
+			time.Sleep(100 * time.Millisecond)
+			count++
+			job.Status = p.getJobStatus(conn, job)
+		}
+
+		return job, nil
 	}
 
 	return nil, nil
